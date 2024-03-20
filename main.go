@@ -17,6 +17,8 @@ import (
     "time"
 )
 
+
+
 const (
     REQ_PING byte =  iota
     REQ_STORE
@@ -48,6 +50,14 @@ type BucketEntry struct {
     Id [ID_SIZE]byte
     Addr string
 }
+
+func bucketEntryFromAddress(addr string) BucketEntry {
+    var res BucketEntry
+    res.Addr = addr;
+    res.Id = sha1.Sum([]byte(addr))
+    return res
+}
+
 
 /* Priority Queue for k bucket entries*/
 type Item struct {
@@ -108,6 +118,18 @@ type Node struct{
     // Everything stays in memory for simplicity
     Storage map[[ID_SIZE]byte][]byte
     BucketsLock sync.RWMutex
+}
+
+
+func (n *Node) logBuckets() {
+    for i:=0; i < ID_SIZE*8; i++ {
+        if n.BucketSizes[i] != 0 {
+            log.Println("Bucket size " + strconv.Itoa(i) + ":" + strconv.Itoa(n.BucketSizes[i]))
+            for j:=0; j < n.BucketSizes[i]; j++ {
+                log.Println(n.Buckets[i][j].Addr)
+            }
+        }
+    }
 }
 
 
@@ -228,6 +250,7 @@ func (n *Node) updateBuckets(otherId [ID_SIZE]byte, addr string) {
             for i := 0; i < bucketSize-1; i++ {
                 bucket[i] = bucket[i+1]
             }
+            // Put new at front
             bucket[bucketSize-1] = &BucketEntry{otherId, addr}
         }
     } else if seenIdx != bucketSize - 1 {
@@ -243,6 +266,29 @@ func (n *Node) updateBuckets(otherId [ID_SIZE]byte, addr string) {
 }
 
 
+func (n *Node) removeFromBuckets(id [ID_SIZE]byte) {
+    n.BucketsLock.Lock()
+    defer n.BucketsLock.Unlock()
+    bucketIdx := getFirstDiffBit(n.Id, id)
+    var i int
+    found := false
+    for i=0; i < n.BucketSizes[bucketIdx]; i++ {
+        if n.Buckets[bucketIdx][i].Id == id {
+            found = true
+            break
+        }
+    }
+
+    if found {
+        for ; i < n.BucketSizes[bucketIdx]-1; i++ {
+            n.Buckets[bucketIdx][i] = n.Buckets[bucketIdx][i+1]
+        }
+        n.BucketSizes[bucketIdx]--
+    }
+
+}
+
+
 /*
  * Ping the node at the given address and ask them to echo a random 160 bits. Returns
  * true if they echo it without error. False otherwise.
@@ -252,7 +298,7 @@ func (n *Node) ping(addr string) bool {
     log.Println("Pinging:", addr)
     c, err := net.Dial("tcp", addr)
     if err != nil {
-        log.Println(err.Error())
+        log.Fatal(err.Error())
         return false
     }
     defer c.Close()
@@ -321,7 +367,7 @@ func (n *Node) store(content []byte) {
 
     c, err := net.Dial("tcp", closest.Addr)
     if err != nil {
-        log.Println(err.Error())
+        log.Fatal(err.Error())
     }
     defer c.Close()
 
@@ -432,7 +478,7 @@ func (n *Node) nodeLookup(id [ID_SIZE]byte) BucketEntry {
             closestSim = next.priority
         }
         // recipient returns k closest nodes it knows about
-        newNodes := n.findNode(next.entry.Addr, id)
+        newNodes := n.findNode(next.entry, id)
         // Loop through new nodes adding any that haven't been seen to queue
         for i:=0; i < len(newNodes); i++ {
             newN := newNodes[i]
@@ -548,10 +594,13 @@ func (n *Node) handleFindHelper(c net.Conn, id [ID_SIZE]byte) {
  * Sends a request to the given address asking for it's K closest neighbors. These
  * or however many neighbors the node has are returned.
  */
-func (n *Node) findNode(addr string, findId [ID_SIZE]byte) []BucketEntry {
-    c, err := net.Dial("tcp", addr)
+func (n *Node) findNode(other *BucketEntry, findId [ID_SIZE]byte) []BucketEntry {
+    c, err := net.Dial("tcp", other.Addr)
     if err != nil {
         log.Println(err.Error())
+        n.logBuckets()
+        n.removeFromBuckets(other.Id)
+        return []BucketEntry{}
     }
     defer c.Close()
 
@@ -594,7 +643,7 @@ func (n *Node) handleFindNode(c net.Conn) {
 func (n *Node) findValue(addr string, findId [ID_SIZE]byte) (value []byte, closests []BucketEntry, wasFound bool) {
     c, err := net.Dial("tcp", addr)
     if err != nil {
-        log.Println(err.Error())
+        log.Fatal(err.Error())
     }
     defer c.Close()
 
@@ -723,63 +772,54 @@ func (n *Node) handleRequest(c net.Conn) {
 
 
 func (n *Node) runNode(addr string, known []*BucketEntry) {
+    var ln net.Listener
+    var err error
     if addr != "" {
         n.Addr = addr
         n.Id = sha1.Sum([]byte(addr))
         log.Println(n.Addr)
 
-        ln, err := net.Listen("tcp", addr)
+        ln, err = net.Listen("tcp", addr)
         if err != nil {
             log.Fatal(err)
-        }
-        defer ln.Close()
-
-        log.Println("Listenting at ", addr)
-        for {
-            conn, err := ln.Accept()
-            if err != nil {
-                log.Println(err.Error())
-            }
-            go n.handleRequest(conn)
         }
     } else {
-        ln, err := net.Listen("tcp", "127.0.0.1:0")
+        ln, err = net.Listen("tcp", "127.0.0.1:0")
         if err != nil {
             log.Fatal(err)
         }
-        defer ln.Close()
-
         n.Addr = ln.Addr().String()
         n.Id = sha1.Sum([]byte(n.Addr))
+    }
+    defer ln.Close()
 
-        // Add known addresses to K buckets
-        for i:=0; i < len(known); i++ {
-            bucketIdx := getFirstDiffBit(n.Id, known[i].Id)
-            size := n.BucketSizes[bucketIdx]
-            if size < 20 {
-                if (n.ping(known[i].Addr)) {
-                    func(){
-                        n.BucketsLock.Lock()
-                        defer n.BucketsLock.Unlock()
-                        n.Buckets[bucketIdx][size] = known[i]
-                        n.BucketSizes[bucketIdx]++
-                    }()
-                }
+    // Add known addresses to K buckets
+    for i:=0; i < len(known); i++ {
+        bucketIdx := getFirstDiffBit(n.Id, known[i].Id)
+        size := n.BucketSizes[bucketIdx]
+        if size < 20 {
+            if (n.ping(known[i].Addr)) {
+                func(){
+                    n.BucketsLock.Lock()
+                    defer n.BucketsLock.Unlock()
+                    n.Buckets[bucketIdx][size] = known[i]
+                    n.BucketSizes[bucketIdx]++
+                }()
             }
         }
+    }
 
-        // Startup node discovery routine
-        go n.runNodeDiscoveryRoutine()
+    // Startup node discovery routine
+    go n.runNodeDiscoveryRoutine()
 
-        // Serve requests
-        log.Println("Listenting at", ln.Addr())
-        for {
-            conn, err := ln.Accept()
-            if err != nil {
-                log.Println(err.Error())
-            }
-            go n.handleRequest(conn)
+    // Serve requests
+    log.Println("Listenting at", ln.Addr())
+    for {
+        conn, err := ln.Accept()
+        if err != nil {
+            log.Println(err.Error())
         }
+        go n.handleRequest(conn)
     }
 }
 
@@ -799,7 +839,7 @@ func (n *Node) runNodeDiscoveryRoutine() {
             continue
         }
 
-        newNodes := n.findNode(closestList[0].Addr, randId)
+        newNodes := n.findNode(closestList[0], randId)
 
         for i:=0; i < len(newNodes) && i < MAX_DISCOVERY_NODES; i++ {
             n.updateBuckets(newNodes[i].Id, newNodes[i].Addr);
@@ -812,6 +852,7 @@ func (n *Node) runNodeDiscoveryRoutine() {
 
 func main() {
 
+    log.SetFlags(log.LstdFlags | log.Lshortfile)
 
     knownPtr := flag.String("known", "", "Known address to connect to. If blank this node starts it's own network.")
     hostPtr := flag.String("host", "127.0.0.1", "Ip address to host this node on.")
