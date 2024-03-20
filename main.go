@@ -1,18 +1,20 @@
 package main
 
 import (
-    "container/heap"
-    "errors"
     "encoding/binary"
+    "errors"
     _ "encoding/hex"
+    "container/heap"
+    "flag"
     "log"
     "net"
+    _ "os"
     "crypto/rand"
     "crypto/sha1"
+    "sort"
     "strconv"
     "sync"
     "time"
-    "os"
 )
 
 const (
@@ -22,21 +24,32 @@ const (
     REQ_FIND_VAL
 )
 
+const (
+    VALUE_NOT_FOUND byte = iota
+    VALUE_FOUND
+)
+
+// Size in bytes of ID. Currently 20 for 160 bit sha1 hash
 const ID_SIZE = 20
 // Size of the "k-buckets" i.e. the number of nodes stored for each distance from self
 const K = 20
 // Maximum number of parallel lookup requests to send at a time
 const N_LOOKUP = 3
 
+// Time between random node lookups for discovery purposes
+const DISCOVERY_PERIOD = 1 * time.Second
+// Maximum number of discovered nodes to add to K buckets
+const MAX_DISCOVERY_NODES = K
 
 
 
+// Entry in K buckets
 type BucketEntry struct {
     Id [ID_SIZE]byte
     Addr string
 }
 
-/* Priority Queue */
+/* Priority Queue for k bucket entries*/
 type Item struct {
     entry *BucketEntry
     priority int
@@ -83,17 +96,26 @@ func (pq *PriorityQueue) Update(item *Item, entry *BucketEntry, priority int) {
 
 /* End Priority Queue */
 
-
+// A node in the kademelia network
 type Node struct{
     Addr string
     Id [ID_SIZE]byte
-    Buckets [ID_SIZE][K]*BucketEntry
-    BucketSizes [ID_SIZE]int
+    // Need (with very low probability) a bucket for each bit where keys start to differ
+    // 8 * ID_SIZE (in bytes) = id size in bits
+    Buckets [ID_SIZE*8][K]*BucketEntry
+    // Number of entries in each bucket
+    BucketSizes [ID_SIZE*8]int
+    // Everything stays in memory for simplicity
     Storage map[[ID_SIZE]byte][]byte
     BucketsLock sync.RWMutex
 }
 
 
+
+/*
+ * Reads enough bytes from the connection to fill the given byte slice or returns 
+ * an error.
+ */
 func readExact(c net.Conn, res []byte) (error) {
     n, err := c.Read(res)
 
@@ -104,6 +126,9 @@ func readExact(c net.Conn, res []byte) (error) {
 }
 
 
+/*
+ * Writes all of the data in the given slice or returns an error.
+ */
 func writeExact(c net.Conn, toWrite []byte) (error) {
     n, err := c.Write(toWrite)
     if n != len(toWrite) {
@@ -113,6 +138,9 @@ func writeExact(c net.Conn, toWrite []byte) (error) {
 }
 
 
+/*
+ * Writes own ID and Address on the connection
+ */
 func (n *Node) writeOwnInfo(c net.Conn) (error) {
     addr := []byte(n.Addr)
     // Need space for ID, length of address (8 bytes), and the address
@@ -124,6 +152,9 @@ func (n *Node) writeOwnInfo(c net.Conn) (error) {
 }
 
 
+/*
+ *  Get the index of the most significant bit where the two id's a and b differ.
+ */
 func getFirstDiffBit(a, b [ID_SIZE]byte) int {
     for i:=0; i < ID_SIZE; i++ {
         diff := a[i] ^ b[i]
@@ -138,8 +169,31 @@ func getFirstDiffBit(a, b [ID_SIZE]byte) int {
     return ID_SIZE * 8 - 1
 }
 
-// NOTE: Update on every request/response
+/*
+ *  Returns true if a is close to tarId than b. False otherwise.
+ */
+func idLessDiff(tarId, a, b [ID_SIZE]byte) bool {
+    for i:=0; i < ID_SIZE; i++ {
+        diffA := tarId[i] ^ a[i]
+        diffB := tarId[i] ^ b[i]
+        if diffA < diffB {
+            return true
+        } else if diffA > diffB {
+            return false
+        }
+    }
+    return false
+
+}
+
+/*
+ * Adds (otherId, addr) to the appropriate k bucket if there is room and checking 
+ * for dead nodes to replace if there isn't. If there is no room the entry is not added
+ */
 func (n *Node) updateBuckets(otherId [ID_SIZE]byte, addr string) {
+    if otherId == n.Id {
+        return
+    }
     n.BucketsLock.Lock()
     defer n.BucketsLock.Unlock()
     bucketIdx := getFirstDiffBit(n.Id, otherId)
@@ -189,6 +243,10 @@ func (n *Node) updateBuckets(otherId [ID_SIZE]byte, addr string) {
 }
 
 
+/*
+ * Ping the node at the given address and ask them to echo a random 160 bits. Returns
+ * true if they echo it without error. False otherwise.
+ */
 func (n *Node) ping(addr string) bool {
 
     log.Println("Pinging:", addr)
@@ -197,6 +255,7 @@ func (n *Node) ping(addr string) bool {
         log.Println(err.Error())
         return false
     }
+    defer c.Close()
 
     n.writeOwnInfo(c)
 
@@ -231,6 +290,10 @@ func (n *Node) ping(addr string) bool {
     return true
 }
 
+
+/*
+ * Handles a ping request to this node from the connected node.
+ */
 func (n *Node) handlePing(c net.Conn) {
     buffer := [ID_SIZE]byte{}
     num, err := c.Read(buffer[:])
@@ -248,6 +311,10 @@ func (n *Node) handlePing(c net.Conn) {
 }
 
 
+/*
+ * Generates an id (hash) for the given content, finds a suitable node on the network,
+ * and requests to store the content at that address.
+ */
 func (n *Node) store(content []byte) {
     id := sha1.Sum(content)
     closest := n.nodeLookup(id)
@@ -256,6 +323,7 @@ func (n *Node) store(content []byte) {
     if err != nil {
         log.Println(err.Error())
     }
+    defer c.Close()
 
     n.writeOwnInfo(c)
 
@@ -268,6 +336,10 @@ func (n *Node) store(content []byte) {
     // TODO: Handle error status returned
 }
 
+
+/*
+ * Handles a store request sent to this node from the connection c
+ */
 func (n *Node) handleStore(c net.Conn) {
     contentSizeBuff := [8]byte{}
     err := readExact(c, contentSizeBuff[:])
@@ -282,29 +354,31 @@ func (n *Node) handleStore(c net.Conn) {
         log.Println(err.Error())
     }
 
-    // TODO: Forward store maybe
     id := sha1.Sum(content)
     n.Storage[id] = content
-    // TODO: Communicate error status back
+    // TODO: Send error status back
 }
 
 
-func (n *Node) getClosest(other [ID_SIZE]byte, num int) []*BucketEntry {
-    //TODO: If num < K sort bucket for closest
+/*
+ * Searches k buckets for the entry with the id closest to tarId
+ */
+func (n *Node) getClosest(tarId [ID_SIZE]byte, num int) []*BucketEntry {
     closests := []*BucketEntry{}
     nClose := 0
-    bucketIdx := getFirstDiffBit(n.Id, other)
+    bucketIdx := getFirstDiffBit(n.Id, tarId)
     n.BucketsLock.RLock()
     defer n.BucketsLock.RUnlock()
-    // Get all from this bucket and more general buckets until we have r closest known
-    for i:=bucketIdx; i >= 0 &&  nClose < num; i-- {
-        for j:=0; nClose < num && j < n.BucketSizes[i]; j++ {
+    // Get all from this bucket and more general buckets until we have at least r closest known
+    for i:=bucketIdx; i >= 0 && nClose < num; i-- {
+        // Don't exit early but store all in last closest bucket (so we can sort them later)
+        for j:=0; j < n.BucketSizes[i]; j++ {
             closests = append(closests, n.Buckets[i][j])
             nClose++
         }
     }
 
-    // Get from more specific buckets (buckets closer to me vs other id) if r closest
+    // Get from more specific buckets (buckets closer to me vs tarId id) if r closest
     // still not found
     for i:=bucketIdx+1; i < len(n.Buckets) && nClose < num; i++ {
         for j:=0; nClose < num && j < n.BucketSizes[i]; j++ {
@@ -313,13 +387,25 @@ func (n *Node) getClosest(other [ID_SIZE]byte, num int) []*BucketEntry {
         }
     }
 
+    // Sort closests according to which Id is most similar to the target
+    sort.Slice(closests, func(i, j int) bool {
+        return idLessDiff(tarId, closests[i].Id, closests[j].Id)
+    })
+
+    if num < nClose {
+        return closests[:num]
+    }
     return closests
+
 }
 
 
+/*
+ * Search connected nodes for the closest node to the given id. Returns a bucket entry
+ * (id, address) for the closest node.
+ */
 func (n *Node) nodeLookup(id [ID_SIZE]byte) BucketEntry {
     // Pick r closest nodes to id (i.e. from k-bucket of same or closest dist)
-
     closests := n.getClosest(id, N_LOOKUP)
     seen := make(map[[ID_SIZE]byte]bool)
     pq := make(PriorityQueue, len(closests))
@@ -379,30 +465,16 @@ func (n *Node) nodeLookup(id [ID_SIZE]byte) BucketEntry {
 }
 
 
-func (n *Node) findNode(addr string, findId [ID_SIZE]byte) []BucketEntry {
-    c, err := net.Dial("tcp", addr)
-    if err != nil {
-        log.Println(err.Error())
-    }
-
-    n.writeOwnInfo(c)
-
-    buffer := [ID_SIZE + 1]byte{}
-    buffer[0] = REQ_FIND_NODE
-    copy(buffer[1:], findId[:])
-    err = writeExact(c, buffer[:])
-    if err != nil {
-        log.Println(err.Error())
-        return nil
-    }
-
+func (n *Node) findHelper(c net.Conn) []BucketEntry {
     numEntryBuffer := [8]byte{}
-    err = readExact(c, numEntryBuffer[:])
+    err := readExact(c, numEntryBuffer[:])
     if err != nil {
         log.Println(err.Error())
     }
+    // Number of nodes/bucket entries returned
     nEntries := int(binary.BigEndian.Uint64(numEntryBuffer[:]))
 
+    // Sizes of each bucket entry's address
     addrSizesBuffer := make([]byte, 8 * nEntries)
     err = readExact(c, addrSizesBuffer[:])
     addrSizes := make([]int, nEntries)
@@ -435,13 +507,14 @@ func (n *Node) findNode(addr string, findId [ID_SIZE]byte) []BucketEntry {
     return res
 }
 
-func (n *Node) handleFindNode(c net.Conn) {
-    id := [ID_SIZE]byte{}
-    err := readExact(c, id[:])
-    if err != nil {
-        log.Println(err)
-    }
 
+
+/*
+ * Since handleFindNode and handleFindValue do the same thing when the value is not 
+ * found this method does that core chunk of the find process, namely, finds the k 
+ * closest k bucket entries and returns them (or all entries if there are less than k)
+ */
+func (n *Node) handleFindHelper(c net.Conn, id [ID_SIZE]byte) {
     closests := n.getClosest(id, K)
     nClose := len(closests)
 
@@ -464,15 +537,130 @@ func (n *Node) handleFindNode(c net.Conn) {
     message = append(message, ids...)
     message = append(message, addrs...)
 
-    err = writeExact(c, message)
+    err := writeExact(c, message)
     if err != nil {
         log.Println(err.Error())
     }
 }
 
 
-func (n *Node) findValue() {
-    // Same as findNode but with early exit on finding the value and caching
+/*
+ * Sends a request to the given address asking for it's K closest neighbors. These
+ * or however many neighbors the node has are returned.
+ */
+func (n *Node) findNode(addr string, findId [ID_SIZE]byte) []BucketEntry {
+    c, err := net.Dial("tcp", addr)
+    if err != nil {
+        log.Println(err.Error())
+    }
+    defer c.Close()
+
+    n.writeOwnInfo(c)
+
+    buffer := [ID_SIZE + 1]byte{}
+    buffer[0] = REQ_FIND_NODE
+    copy(buffer[1:], findId[:])
+    err = writeExact(c, buffer[:])
+    if err != nil {
+        log.Println(err.Error())
+        return nil
+    }
+
+    return n.findHelper(c)
+}
+
+
+/*
+ * Handle a findNode request from the connected node. Finds the closest node in own
+ * k buckets to the target id sent from the connected node and responds with them.
+ */
+func (n *Node) handleFindNode(c net.Conn) {
+    id := [ID_SIZE]byte{}
+    err := readExact(c, id[:])
+    if err != nil {
+        log.Println(err)
+    }
+
+    n.handleFindHelper(c, id)
+
+}
+
+
+/*
+ * Sends request to a given address looking for a value stored under the given findId. 
+ * If found, the value is returned. Otherwise the closest nodes the other node knows
+ * are returned.
+ */
+func (n *Node) findValue(addr string, findId [ID_SIZE]byte) (value []byte, closests []BucketEntry, wasFound bool) {
+    c, err := net.Dial("tcp", addr)
+    if err != nil {
+        log.Println(err.Error())
+    }
+    defer c.Close()
+
+    n.writeOwnInfo(c)
+
+    buffer := [ID_SIZE + 1]byte{}
+    buffer[0] = REQ_FIND_NODE
+    copy(buffer[1:], findId[:])
+    err = writeExact(c, buffer[:])
+    if err != nil {
+        log.Println(err.Error())
+        return []byte{}, []BucketEntry{}, false
+    }
+
+
+    wasFoundBuffer := [1]byte{}
+    err = readExact(c, wasFoundBuffer[:])
+    if err != nil {
+        log.Println(err.Error())
+    }
+
+    wasFound = wasFoundBuffer[0] == VALUE_FOUND
+    if wasFound {
+        closests = []BucketEntry{}
+
+        lenBuffer := [8]byte{}
+        err = readExact(c, lenBuffer[:])
+        if err != nil {
+            log.Println(err.Error())
+            return []byte{}, []BucketEntry{}, false
+        }
+
+        value := make([]byte, binary.BigEndian.Uint64(lenBuffer[:]))
+        readExact(c, value)
+
+    } else {
+        value = []byte{}
+        closests = n.findHelper(c)
+    }
+
+    return
+}
+
+func (n *Node) handleFindValue(c net.Conn) {
+    // TODO: caching
+    id := [ID_SIZE]byte{}
+    err := readExact(c, id[:])
+    if err != nil {
+        log.Println(err)
+    }
+
+    value, exists := n.Storage[id]
+    if exists {
+        // Send the value
+        buffer := make([]byte, 1 + 8 + len(value))
+        buffer[0] = VALUE_FOUND
+        binary.BigEndian.PutUint64(buffer[1:9], uint64(len(value)))
+        copy(buffer[9:], value)
+        writeExact(c, buffer[:])
+    } else {
+        // Send the k closest nodes this node konws about
+        buffer := [1]byte{}
+        buffer[0] = VALUE_NOT_FOUND
+        writeExact(c, buffer[:])
+        n.handleFindHelper(c, id)
+    }
 }
 
 
@@ -538,6 +726,7 @@ func (n *Node) runNode(addr string, known []*BucketEntry) {
     if addr != "" {
         n.Addr = addr
         n.Id = sha1.Sum([]byte(addr))
+        log.Println(n.Addr)
 
         ln, err := net.Listen("tcp", addr)
         if err != nil {
@@ -563,17 +752,26 @@ func (n *Node) runNode(addr string, known []*BucketEntry) {
         n.Addr = ln.Addr().String()
         n.Id = sha1.Sum([]byte(n.Addr))
 
+        // Add known addresses to K buckets
         for i:=0; i < len(known); i++ {
             bucketIdx := getFirstDiffBit(n.Id, known[i].Id)
             size := n.BucketSizes[bucketIdx]
             if size < 20 {
                 if (n.ping(known[i].Addr)) {
-                    n.Buckets[bucketIdx][size] = known[i]
-                    n.BucketSizes[bucketIdx]++
+                    func(){
+                        n.BucketsLock.Lock()
+                        defer n.BucketsLock.Unlock()
+                        n.Buckets[bucketIdx][size] = known[i]
+                        n.BucketSizes[bucketIdx]++
+                    }()
                 }
             }
         }
 
+        // Startup node discovery routine
+        go n.runNodeDiscoveryRoutine()
+
+        // Serve requests
         log.Println("Listenting at", ln.Addr())
         for {
             conn, err := ln.Accept()
@@ -586,98 +784,64 @@ func (n *Node) runNode(addr string, known []*BucketEntry) {
 }
 
 
+func (n *Node) runNodeDiscoveryRoutine() {
+    for {
+        time.Sleep(DISCOVERY_PERIOD)
+        randId := [ID_SIZE]byte{}
+        _, err := rand.Read(randId[:])
+        if err != nil {
+            log.Println(err.Error())
+            continue
+        }
+
+        closestList := n.getClosest(randId, 1)
+        if len(closestList) == 0 {
+            continue
+        }
+
+        newNodes := n.findNode(closestList[0].Addr, randId)
+
+        for i:=0; i < len(newNodes) && i < MAX_DISCOVERY_NODES; i++ {
+            n.updateBuckets(newNodes[i].Id, newNodes[i].Addr);
+        }
+
+
+    }
+}
+
+
 func main() {
 
-    if len(os.Args) == 1 {
-        var node Node
-        node.Addr = "127.0.0.1:6969"
-        node.Id = sha1.Sum([]byte(node.Addr))
 
-        for i:=0; i < 50; i++ {
-            addr := "127.0.0.1:" + strconv.Itoa(5970+i)
-            id := sha1.Sum([]byte(addr))
-            node.updateBuckets(id, addr)
-            log.Println(node.BucketSizes)
-        }
+    knownPtr := flag.String("known", "", "Known address to connect to. If blank this node starts it's own network.")
+    hostPtr := flag.String("host", "127.0.0.1", "Ip address to host this node on.")
+    portPtr := flag.Int("port", 6969, "Port to host this node on.")
 
-        ln, err := net.Listen("tcp", ":6969")
-        if err != nil {
-            log.Fatal(err)
-        }
+    numExtraPtr := flag.Int("extra", 0, "Number of extra nodes to start and connect.")
+    startupDelayPtr := flag.Int("delay", 2000, "Milliseconds to wait after starting first node before starting the rest when starting a network.")
 
-        log.Println("Listening on port:", "6969")
-        for {
-            conn, err := ln.Accept()
-            if err != nil {
-                log.Println(err.Error())
-            }
+    flag.Parse()
 
-            go node.handleRequest(conn)
-        }
-    } else if os.Args[1] == "test" {
-        //var node Node
-        //node.Addr = "127.0.0.1:6969"
-        //node.Id = sha1.Sum([]byte(node.Addr))
-
-        //for i:=0; i < 50; i++ {
-        //    addr := "127.0.0.1:" + strconv.Itoa(5970+i)
-        //    id := sha1.Sum([]byte(addr))
-        //    node.updateBuckets(id, addr)
-        //    log.Println(node.BucketSizes)
-        //}
-
-        //toLook := sha1.Sum([]byte("127.0.0.1:420"))
-        //log.Println("Id:", toLook);
-        //node.nodeLookup(toLook)
-
-        pq := make(PriorityQueue, 20)
-        for i:=0; i < 20; i++ {
-            pq[i] = &Item{
-                entry:&BucketEntry{},
-                priority: i,
-                index: i,
-            }
-        }
-        heap.Init(&pq)
-
-        //for pq.Len() > 0 {
-        //    log.Println(heap.Pop(&pq).(*Item).priority)
-        //}
-        //log.Println()
-
-        for i:=0; i < 100; i++ {
-            heap.Push(&pq, &Item{
-                entry: &BucketEntry{},
-                priority: i,
-            })
-        }
-
-        for pq.Len() > 0 {
-            log.Println(heap.Pop(&pq).(*Item).priority)
-        }
-    } else if os.Args[1] == "n" {
-        numNodes, err := strconv.Atoi(os.Args[2])
-        if err != nil {
-            log.Fatal(err)
-        }
-
-        nodes := make([]Node, numNodes)
-
-        rootAddr := "127.0.0.1:6969"
-
+    nodes := make([]Node,*numExtraPtr+1)
+    if *knownPtr == "" {
+        rootAddr := *hostPtr + ":" + strconv.Itoa(*portPtr)
         go (&nodes[0]).runNode(rootAddr, []*BucketEntry{})
 
-        time.Sleep(2 * time.Second)
+        time.Sleep(time.Duration(*startupDelayPtr) * time.Millisecond)
 
         known := []*BucketEntry{ &BucketEntry{sha1.Sum([]byte(rootAddr)), rootAddr} }
-        for i:=1; i < numNodes; i++ {
+        for i:=1; i < len(nodes); i++ {
             go (&nodes[i]).runNode("", known)
         }
-
-        time.Sleep(2 * time.Second);
-
-        for {}
+    } else {
+        known := []*BucketEntry{ &BucketEntry{sha1.Sum([]byte(*knownPtr)), *knownPtr} }
+        for i:=0; i < len(nodes); i++ {
+            go (&nodes[i]).runNode("", known)
+        }
     }
+
+    /*Run until interrupt*/
+    for {}
 }
 
 
