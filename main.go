@@ -192,7 +192,7 @@ func getFirstDiffBit(a, b [ID_SIZE]byte) int {
 }
 
 /*
- *  Returns true if a is close to tarId than b. False otherwise.
+ *  Returns true if a is closer to tarId than b. False otherwise.
  */
 func idLessDiff(tarId, a, b [ID_SIZE]byte) bool {
     for i:=0; i < ID_SIZE; i++ {
